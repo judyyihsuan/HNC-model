@@ -1,0 +1,1034 @@
+---
+title: "Untitled"
+output: html_document
+date: "2023-12-20"
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Load packages
+```{r}
+if (!require('pacman')) install.packages('pacman'); library(pacman) # use this package to conveniently install other packages
+# load (install if required) packages from CRAN
+p_load( "dplyr", "devtools", "gems", "flexsurv", "survminer", "survHE", "ggplot2", "msm", "igraph", "mstate", "reshape2", "knitr", "diagram", "abind", "DES", "dampack", "data.table", "tm", "juicr", "readr", "here")
+ #install_github("DARTH-git/dampack", force = TRUE) #Uncomment if there is a newer version
+ #install_github("DARTH-git/darthtools", force = TRUE) #Uncomment if there is a newer version
+p_load_gh( "DARTH-git/darthtools")
+library(readxl)
+library(rlist)
+source(here::here("icer_func.R"))
+```
+
+```{r}
+v_n       <- c("PF", "PD","D")  # state names
+n_states  <- length(v_n)                   # No of states 
+n_i       <- 2000                          # number of simulations
+c_l       <- 2                             # cycle length in months
+n_t       <- 50*6                         # number of cycle * years (50 years)
+times     <- seq(0, n_t, c_l)              # the cycles in years
+v_names_states <- v_n
+n_cycles  <- 300
+n_Toxicity <-3
+v_names_toxicity <- c("MU", "XE", "DY")
+n_cohort <- 3
+v_names_cohort <-c(1,2,3)
+v_names_cycles  <- paste("cycle", 0:n_cycles) 
+v_names_cycles_a <- paste("cycle", 0:(n_cycles+1))
+# general inputs
+
+weeks_per_cycle <- 8                       # weeks per cycle
+cdr <- 0.04                                #cost discount rate
+odr <- 0.015                               # outcome discount rate
+cdr_2m <- (1+cdr) ^ (1/6) - 1 
+odr_2m <- (1+odr) ^ (1/6) - 1 
+v_dwc <- 1 / ((1 + cdr_2m) ^ (0:(300)))       # vector with discount weights for costs
+v_dwe <- 1 / ((1 + odr_2m) ^ (0:(300)))      # vector with discount weights for outcomes
+set.seed(123)  # set the seed
+n_trt<-2
+v_names_trt<-c("RT","PT")
+n_iter<-5000
+```
+
+```{r}
+library(readxl)
+param <- read_excel("param_new recovery rate.xlsx")
+
+
+
+make_psa_df <- function(param, n_iter, seed = 123){
+  set.seed(seed) # set a seed to be able to reproduce the same results
+ 
+  param_psa         <- as.data.frame(lapply(param, rep, n_iter))
+  param_psa$psa_est <- NA
+  param_psa$iter    <- rep(1:n_iter, each = nrow(param)) 
+  
+  for(i in 1:nrow(param)){    # loop over all parameters, in all diseases
+    if(param[i, "Distribution"] == "fixed"){
+      param_psa$psa_est[param_psa$Param   == param$Param[i]] <- with(param[i,],Med)
+      
+    }else{ #if distribution is not triangle, but normal
+      if(param[i, "Distribution"] == "Normal"){
+        param_psa$psa_est[param_psa$Param      == param$Param[i]] <- with(param[i, ], 
+                                                                         rnorm(n = n_iter ,
+                                                                               mean = Med,
+                                                                               sd = (Hi_beta - Med)/1.96))
+      }else{ #if distribution is not triangle, nor normal
+        if(param[i, "Distribution"] == "gamma"){
+          param_psa$psa_est[param_psa$Param      == param$Param[i]] <- with(param[i, ], 
+                                                                           rgamma(n =n_iter ,
+                                                                                 shape = Lo_alpha,
+                                                                                 scale = Hi_beta))
+        }else{ #if distribution is not triangle/normal/lognormal
+          if(param[i,"Distribution"] == "beta"){
+            param_psa$psa_est[param_psa$Param      == param$Param[i]] <- with(param[i, ],
+                                                                                rbeta(n = n_iter,
+                                                                                 shape1 = Lo_alpha,
+                                                                                 shape2 = Hi_beta)) 
+            
+            
+            
+            
+          }
+        }
+      }
+    }
+  }
+  
+  return(param_psa)
+}
+
+gen_psa <- function(df_param_psa){
+  # Argument
+  ## df_param_psa: A dataframe with the parameter values for the PSA
+  # Return
+  ## df_psa_input: The input values of each PSA iteration in a dataframe of size n_sim x n_parameters
+  
+  param_names <- unique(df_param_psa$Param)
+  n_sim <- length(unique(df_param_psa$iter))
+  
+  # Create a matrix to store the results 
+  df_psa_input <- matrix(data = NA, nrow = n_sim, ncol = length(param_names),
+                         dimnames = list(c(1:n_sim), param_names))
+  
+  for(p in 1:length(param_names)){
+    df_psa_input[, p] <- df_param_psa$psa_est[df_param_psa$Param == param_names[p]]
+  }
+  
+  df_psa_input <- as.data.frame(df_psa_input) # Make a dataframe from the matrix 
+  
+  return(df_psa_input) # Return the psa input dataframe
+}
+```
+
+
+```{r}
+df_psa <- function(params) {
+  # run following code with a set of data 
+  results_df <- data.frame(  # Create an empty data frame to store results
+      v_totalc_tx_RT= numeric(),
+      v_totalc_tx_PT= numeric(),
+      v_totaldisc_tx_RT=numeric(),
+      v_totaldisc_tx_PT=numeric(),
+      v_dis_tc_PT=numeric(),
+      v_dis_tc_RT=numeric(),
+      v_tc_PT = numeric(),
+      v_tc_RT = numeric(),
+      v_LY_RT = numeric(),
+      v_LY_PT = numeric(),
+      v_dis_totalu_RT = numeric(),
+      v_dis_totalu_RT = numeric(),
+      v_totalu_PT = numeric(),
+      v_totalu_RT = numeric(),
+      ICER = numeric(),
+      ICER_dis = numeric()
+     
+  )
+  
+result_list <- list()
+ 
+  for(i in 1:nrow(df_psa_input)){ 
+  
+    a_P_RT_total <- array(0,  # Create 3-D array
+                dim = c(n_states, n_states, n_cycles),
+                dimnames = list(v_names_states, v_names_states, 
+                                v_names_cycles[-length(v_names_cycles)]))
+ 
+Female<-df_psa_input[i,"female"]
+new_background <- read_excel("background_M.xlsx")
+new_background<- as.data.frame(new_background)
+weighted_mortality <- new_background["Male"]*(1-Female)+new_background["Female"]*(Female)
+colnames(weighted_mortality)<-c("m_rate")
+p_mort_compare<-c(rep(df_psa_input[i,"p_mort"],300))
+
+p_mort_compare<-cbind(weighted_mortality,p_mort_compare)
+p_mort_compare<-as.data.frame(p_mort_compare)
+
+p_mort_compare <- p_mort_compare %>% 
+  mutate(max_mort = pmax(m_rate, p_mort_compare))
+
+p_mort_new <- p_mort_compare$max_mort 
+p_mort_new<-as.matrix(p_mort_new)
+
+coeff_PFS<-1.53
+
+p_PFS<-1-(p_mort_new*coeff_PFS)
+
+a_P_RT_total["PF", "PF",] <- p_PFS
+a_P_RT_total["PF", "PD",] <- (1-p_mort_new)-p_PFS
+a_P_RT_total["PF", "D",]  <- (p_mort_new)
+
+
+# from PD
+a_P_RT_total["PD", "PF",] <- 0
+a_P_RT_total["PD", "PD",] <- 1-p_mort_new
+a_P_RT_total["PD", "D",]  <- p_mort_new
+
+# from D
+a_P_RT_total["D", "PF",] <- 0
+a_P_RT_total["D", "PD",] <- 0
+a_P_RT_total["D", "D",]  <- 1
+
+
+a_P_PT_total<-a_P_RT_total
+
+
+
+v_s_init <- c("PF" = 1, "PD" = 0, "D" = 0)  
+
+
+## Initialize cohort trace for cSTM for all strategies
+m_M_RT <- matrix(0, 
+                  nrow = (n_cycles+1), ncol = n_states, 
+                  dimnames = list(v_names_cycles, v_names_states))
+
+# Store the initial state vector in the first row of the cohort trace
+m_M_RT[1, ] <- v_s_init
+## Initialize cohort traces
+m_M_PT <- m_M_RT  # structure and initial states remain the same
+
+# 05 Run Markov model
+
+for (t in 1:(n_cycles)){  # loop through the number of cycles
+  # estimate the cohort trace for cycle t + 1 using the t-th matrix from the probability array 
+  
+  m_M_RT[t + 1, ] <- m_M_RT[t, ] %*% a_P_RT_total[, , t] 
+  m_M_PT[t + 1, ] <- m_M_PT[t, ] %*% a_P_PT_total[, , t] 
+}
+    
+
+#creating array for incidence
+a_inc_tx_RT <- array(0,  # Create 3-D array
+                dim = c(n_Toxicity, n_cohort, n_cycles+1),
+                dimnames = list(v_names_toxicity, v_names_cohort, 
+                                v_names_cycles)) # name the dimensions of the array 
+
+a_inc_tx_PT <- array(0,  # Create 3-D array
+                dim = c(n_Toxicity, n_cohort, n_cycles+1),
+                dimnames = list(v_names_toxicity, v_names_cohort, 
+                                v_names_cycles)) # name the dimensions of the array 
+#assigning incidence to incidence array for RT    
+  #adding probability of toxicity incidence
+
+pr_XE_RT_1 <- c(df_psa_input[i,"p_XE_RT"], rep(0,n_cycles))
+pr_XE_RT_2 <- c(0, (1-df_psa_input[i,"p_XE_RT"])*df_psa_input[i,"p_XE_RT"], rep(0,n_cycles-1))
+pr_XE_RT_3 <- c(0,0,(1-df_psa_input[i,"p_XE_RT"])^2*df_psa_input[i,"p_XE_RT"], rep(0,n_cycles-2))
+
+pr_XE_PT_1 <- c(df_psa_input[i,"p_XE_PT"], rep(0,n_cycles))
+pr_XE_PT_2 <- c(0, (1-df_psa_input[i,"p_XE_PT"])*df_psa_input[i,"p_XE_PT"], rep(0,n_cycles-1))
+pr_XE_PT_3 <- c(0,0,(1-df_psa_input[i,"p_XE_PT"])^2*df_psa_input[i,"p_XE_PT"], rep(0,n_cycles-2))
+
+
+pr_MU_RT_1 <- c(df_psa_input[i,"p_MU_RT"], rep(0,n_cycles))
+pr_MU_RT_2 <- c(0, (1-df_psa_input[i,"p_MU_RT"])*df_psa_input[i,"p_MU_RT"], rep(0,n_cycles-1))
+pr_MU_RT_3 <- c(0,0,(1-df_psa_input[i,"p_MU_RT"])^2*df_psa_input[i,"p_MU_RT"], rep(0,n_cycles-2))
+
+pr_MU_PT_1 <- c(df_psa_input[i,"p_MU_PT"], rep(0,n_cycles))
+pr_MU_PT_2 <- c(0, (1-df_psa_input[i,"p_MU_PT"])*df_psa_input[i,"p_MU_PT"], rep(0,n_cycles-1))
+pr_MU_PT_3 <- c(0,0,(1-df_psa_input[i,"p_MU_PT"])^2*df_psa_input[i,"p_MU_PT"], rep(0,n_cycles-2))
+
+
+pr_DY_RT_1 <- c(df_psa_input[i,"p_DY_RT"], rep(0,n_cycles))
+pr_DY_RT_2 <- c(0, (1-df_psa_input[i,"p_DY_RT"])*df_psa_input[i,"p_DY_RT"], rep(0,n_cycles-1))
+pr_DY_RT_3 <- c(0,0,(1-df_psa_input[i,"p_DY_RT"])^2*df_psa_input[i,"p_DY_RT"], rep(0,n_cycles-2))
+
+pr_DY_PT_1 <- c(df_psa_input[i,"p_DY_PT"], rep(0,n_cycles))
+pr_DY_PT_2 <- c(0, (1-df_psa_input[i,"p_DY_PT"])*df_psa_input[i,"p_DY_PT"], rep(0,n_cycles-1))
+pr_DY_PT_3 <- c(0,0,(1-df_psa_input[i,"p_DY_PT"])^2*df_psa_input[i,"p_DY_PT"], rep(0,n_cycles-2))
+
+
+
+a_inc_tx_RT["MU", 1,] <- pr_MU_RT_1
+a_inc_tx_RT["MU", 2,] <- pr_MU_RT_2
+a_inc_tx_RT["MU", 3,] <- pr_MU_RT_3
+
+
+
+a_inc_tx_RT["XE", 1,] <- pr_XE_RT_1
+a_inc_tx_RT["XE", 2,] <- pr_XE_RT_2
+a_inc_tx_RT["XE", 3,] <- pr_XE_RT_3
+
+
+a_inc_tx_RT["DY", 1,] <- pr_DY_RT_1
+a_inc_tx_RT["DY", 2,] <- pr_DY_RT_2
+a_inc_tx_RT["DY", 3,] <- pr_DY_RT_3
+
+
+#incidence array for PT
+
+a_inc_tx_PT["MU", 1,] <- pr_MU_PT_1
+a_inc_tx_PT["MU", 2,] <- pr_MU_PT_2
+a_inc_tx_PT["MU", 3,] <- pr_MU_PT_3
+
+
+a_inc_tx_PT["XE", 1,] <- pr_XE_PT_1
+a_inc_tx_PT["XE", 2,] <- pr_XE_PT_2
+a_inc_tx_PT["XE", 3,] <- pr_XE_PT_3
+
+
+a_inc_tx_PT["DY", 1,] <- pr_DY_PT_1
+a_inc_tx_PT["DY", 2,] <- pr_DY_PT_2
+a_inc_tx_PT["DY", 3,] <- pr_DY_PT_3
+
+
+## 04.2 Transition probability array for toxicity recovery
+
+a_P_RT <- array(0,  # Create 3-D array
+                dim = c(n_Toxicity, n_cohort, n_cycles+1),
+                dimnames = list(v_names_toxicity, v_names_cohort, 
+                                v_names_cycles)) # name the dimensions of the array 
+
+a_P_PT <- array(0,  # Create 3-D array
+                dim = c(n_Toxicity, n_cohort, n_cycles+1),
+                dimnames = list(v_names_toxicity, v_names_cohort, 
+                                v_names_cycles)) # name the dimensions of
+
+p_pt_XE_1<- c(1, df_psa_input[i,"p_pt_XE_1_1"],df_psa_input[i,"p_pt_XE_1_2"],df_psa_input[i,"p_pt_XE_1_3"], df_psa_input[i,"p_pt_XE_1_4"], df_psa_input[i,"p_pt_XE_1_5"], df_psa_input[i,"p_pt_XE_1_6"], df_psa_input[i,"p_pt_XE_1_7"], df_psa_input[i,"p_pt_XE_1_8"] , rep(1,n_cycles-8))
+p_pt_XE_2<- c(0, 1, df_psa_input[i,"p_pt_XE_1_1"],df_psa_input[i,"p_pt_XE_1_2"],df_psa_input[i,"p_pt_XE_1_3"], df_psa_input[i,"p_pt_XE_1_4"], df_psa_input[i,"p_pt_XE_1_5"], df_psa_input[i,"p_pt_XE_1_6"], df_psa_input[i,"p_pt_XE_1_7"], df_psa_input[i,"p_pt_XE_1_8"], rep(1,n_cycles-9))
+p_pt_XE_3<- c(0, 0, 1,df_psa_input[i,"p_pt_XE_1_1"],df_psa_input[i,"p_pt_XE_1_2"],df_psa_input[i,"p_pt_XE_1_3"], df_psa_input[i,"p_pt_XE_1_4"], df_psa_input[i,"p_pt_XE_1_5"], df_psa_input[i,"p_pt_XE_1_6"], df_psa_input[i,"p_pt_XE_1_7"], df_psa_input[i,"p_pt_XE_1_8"], rep(1,n_cycles-10))
+
+p_pt_MU_1 <-c(1, df_psa_input[i,"p_pt_MU_1_1"], df_psa_input[i,"p_pt_MU_1_2"], df_psa_input[i,"p_pt_MU_1_3"], df_psa_input[i,"p_pt_MU_1_4"], df_psa_input[i,"p_pt_MU_1_5"], df_psa_input[i,"p_pt_MU_1_6"], df_psa_input[i,"p_pt_MU_1_7"],    df_psa_input[i,"p_pt_MU_1_8"], df_psa_input[i,"p_pt_MU_1_9"],
+df_psa_input[i,"p_pt_MU_1_10"],
+df_psa_input[i,"p_pt_MU_1_11"],
+df_psa_input[i,"p_pt_MU_1_12"],0, rep(1,n_cycles-13))
+
+p_pt_MU_2 <-c(0,1, df_psa_input[i,"p_pt_MU_1_1"], df_psa_input[i,"p_pt_MU_1_2"], df_psa_input[i,"p_pt_MU_1_3"], df_psa_input[i,"p_pt_MU_1_4"], df_psa_input[i,"p_pt_MU_1_5"], df_psa_input[i,"p_pt_MU_1_6"], df_psa_input[i,"p_pt_MU_1_7"],    df_psa_input[i,"p_pt_MU_1_8"], df_psa_input[i,"p_pt_MU_1_9"],
+df_psa_input[i,"p_pt_MU_1_10"],
+df_psa_input[i,"p_pt_MU_1_11"],
+df_psa_input[i,"p_pt_MU_1_12"],0, rep(1,n_cycles-14))
+p_pt_MU_3 <-c(0,0,1, df_psa_input[i,"p_pt_MU_1_1"], df_psa_input[i,"p_pt_MU_1_2"], df_psa_input[i,"p_pt_MU_1_3"], df_psa_input[i,"p_pt_MU_1_4"], df_psa_input[i,"p_pt_MU_1_5"], df_psa_input[i,"p_pt_MU_1_6"], df_psa_input[i,"p_pt_MU_1_7"],    df_psa_input[i,"p_pt_MU_1_8"], df_psa_input[i,"p_pt_MU_1_9"],
+df_psa_input[i,"p_pt_MU_1_10"],
+df_psa_input[i,"p_pt_MU_1_11"],
+df_psa_input[i,"p_pt_MU_1_12"],0, rep(1,n_cycles-15))
+
+p_pt_DY_1 <- c(1, df_psa_input[i,"p_pt_DY_1_1"], df_psa_input[i,"p_pt_DY_1_2"],  df_psa_input[i,"p_pt_DY_1_3"], df_psa_input[i,"p_pt_DY_1_4"],df_psa_input[i,"p_pt_DY_1_5"],df_psa_input[i,"p_pt_DY_1_6"],df_psa_input[i,"p_pt_DY_1_7"],df_psa_input[i,"p_pt_DY_1_8"], rep(1,n_cycles-8))
+p_pt_DY_2 <- c(0, 1, df_psa_input[i,"p_pt_DY_1_1"], df_psa_input[i,"p_pt_DY_1_2"],  df_psa_input[i,"p_pt_DY_1_3"], df_psa_input[i,"p_pt_DY_1_4"],df_psa_input[i,"p_pt_DY_1_5"],df_psa_input[i,"p_pt_DY_1_6"],df_psa_input[i,"p_pt_DY_1_7"],df_psa_input[i,"p_pt_DY_1_8"], rep(1,n_cycles-9))
+p_pt_DY_3 <- c(0, 0, 1, df_psa_input[i,"p_pt_DY_1_1"], df_psa_input[i,"p_pt_DY_1_2"],  df_psa_input[i,"p_pt_DY_1_3"], df_psa_input[i,"p_pt_DY_1_4"],df_psa_input[i,"p_pt_DY_1_5"],df_psa_input[i,"p_pt_DY_1_6"],df_psa_input[i,"p_pt_DY_1_7"],df_psa_input[i,"p_pt_DY_1_8"], rep(1,n_cycles-10))
+
+
+
+p_rt_XE_1<- p_pt_XE_1
+p_rt_XE_2<- p_pt_XE_2
+p_rt_XE_3<- p_pt_XE_3
+
+p_rt_MU_1 <-p_pt_MU_1
+p_rt_MU_2 <-p_pt_MU_2 
+p_rt_MU_3 <-p_pt_MU_3 
+
+p_rt_DY_1 <- p_pt_DY_1
+p_rt_DY_2 <- p_pt_DY_2
+p_rt_DY_3 <- p_pt_DY_3
+
+p_survival<-1-(p_mort_new)
+add <-0.8612745
+p_survival<- rbind(p_survival,add)
+#calculate cost for tx
+#The XE in the general population include grade1 and grade2
+#The p_XE1 is calculated from the HPTC data as XE1/(XE1+XE2)
+#ratio_DY3 is g3/g1+g2+g3
+
+
+c_XE1<-((df_psa_input[i,"ru_fill_XE1"]*df_psa_input[i,"p_ru_fill_XE1"]*df_psa_input[i,"uc_fill"])+
+              (df_psa_input[i,"ru_crown_XE1"]*df_psa_input[i,"p_ru_crown_XE1"]*df_psa_input[i,"uc_crown"])+
+              (df_psa_input[i,"ru_fixed_partial_dentures_XE1"]*df_psa_input[i,"p_ru_fixed_partial_dentures_XE1"]*df_psa_input[i,"uc_fixed_partial_dentures"])+
+              (df_psa_input[i,"ru_dentist_consult_per_year_XE1"]*df_psa_input[i,"p_ru_dentist_consult_per_year_XE1"]*df_psa_input[i,"uc_dentist_consult"])+
+              (df_psa_input[i,"ru_Natriumfloride_gel_per_year_XE1"]*df_psa_input[i,"p_ru_Natriumfloride_gel_per_year_XE1"]*df_psa_input[i,"uc_Natriumfloride_gel_per_100g"])+
+              (df_psa_input[i,"p_ru_root_canal_XE1"]*df_psa_input[i,"uc_root_canal"])+
+              (df_psa_input[i,"p_ru_dental_plate_XE1"]*df_psa_input[i,"uc_dental_plate"])+
+              (df_psa_input[i,"p_ru_dental_implants_XE2"]*df_psa_input[i,"uc_dental_implants"]))
+c_XE2<- ((df_psa_input[i,"ru_fill_XE2"]*df_psa_input[i,"p_ru_fill_XE2"]*df_psa_input[i,"uc_fill"])+
+              (df_psa_input[i,"ru_crown_XE2"]*df_psa_input[i,"p_ru_crown_XE2"]*df_psa_input[i,"uc_crown"])+
+              (df_psa_input[i,"ru_fixed_partial_dentures_XE2"]*df_psa_input[i,"p_ru_fixed_partial_dentures_XE2"]*df_psa_input[i,"uc_fixed_partial_dentures"])+
+              (df_psa_input[i,"ru_dentist_consult_per_cycle_XE2"]*df_psa_input[i,"p_ru_dentist_consult_per_cycle_XE2"]*df_psa_input[i,"uc_dentist_consult"])+
+              (df_psa_input[i,"ru_Natriumfloride_gel_per_cycle_XE2"]*df_psa_input[i,"p_ru_Natriumfloride_gel_per_cycle_XE2"]*df_psa_input[i,"uc_Natriumfloride_gel_per_100g"])+
+              (df_psa_input[i,"p_ru_root_canal_XE2"]*df_psa_input[i,"uc_root_canal"])+
+              (df_psa_input[i,"p_ru_dental_plate_XE2"]*df_psa_input[i,"uc_dental_plate"])+
+              (df_psa_input[i,"p_ru_dental_implants_XE2"]*df_psa_input[i,"uc_dental_implants"]))
+
+c_XE3<-((df_psa_input[i,"ru_fill_XE2"]*df_psa_input[i,"p_ru_fill_XE2"]*df_psa_input[i,"uc_fill"])+
+              (df_psa_input[i,"ru_crown_XE2"]*df_psa_input[i,"p_ru_crown_XE2"]*df_psa_input[i,"uc_crown"])+
+              (df_psa_input[i,"ru_fixed_partial_dentures_XE2"]*df_psa_input[i,"p_ru_fixed_partial_dentures_XE2"]*df_psa_input[i,"uc_fixed_partial_dentures"])+
+              (df_psa_input[i,"ru_dentist_consult_per_cycle_XE2"]*df_psa_input[i,"p_ru_dentist_consult_per_cycle_XE2"]*df_psa_input[i,"uc_dentist_consult"])+
+              (df_psa_input[i,"ru_Natriumfloride_gel_per_cycle_XE2"]*df_psa_input[i,"p_ru_Natriumfloride_gel_per_cycle_XE2"]*df_psa_input[i,"uc_Natriumfloride_gel_per_100g"])+
+              (df_psa_input[i,"p_ru_root_canal_XE2"]*df_psa_input[i,"uc_root_canal"])+
+              (df_psa_input[i,"p_ru_dental_plate_XE2"]*df_psa_input[i,"uc_dental_plate"])+
+              (df_psa_input[i,"p_ru_dental_implants_XE2"]*df_psa_input[i,"uc_dental_implants"]))
+
+c_XE_RT <-c_XE1*(1-df_psa_input[i,"ratio_XE3_RT"])*( df_psa_input[i,"p_XE1"])+
+          c_XE2*(1-df_psa_input[i,"ratio_XE3_RT"])*(1-df_psa_input[i,"p_XE1"])+
+          c_XE3*(df_psa_input[i,"ratio_XE3_RT"])
+
+c_XE_PT <-c_XE1*(1-df_psa_input[i,"ratio_XE3_PT"])*( df_psa_input[i,"p_XE1"])+
+          c_XE2*(1-df_psa_input[i,"ratio_XE3_PT"])*(1-df_psa_input[i,"p_XE1"])+
+          c_XE3*(df_psa_input[i,"ratio_XE3_PT"])
+
+
+
+c_DY1<-((df_psa_input[i,"ru_nutrition_DY1"]*df_psa_input[i,"p_ru_nutrition_DY1"]*df_psa_input[i,"uc_nutrition"])+
+            (df_psa_input[i,"ru_lit_tubefeeding_per_cycle_DY1"]*df_psa_input[i,"p_ru_lit_tubefeeding_per_cycle_DY1"]*df_psa_input[i,"uc_tubefeeding_pp"])+
+            (df_psa_input[i,"p_ru_lit_tubefeeding_per_cycle_DY1"]*df_psa_input[i,"uc_feedingtube_procdure"]))
+
+c_DY2<- ((df_psa_input[i,"ru_nutrition_DY2"]*df_psa_input[i,"p_ru_nutrition_DY2"]*df_psa_input[i,"uc_nutrition"])+
+            (df_psa_input[i,"ru_lit_tubefeeding_per_cycle_DY2"]*df_psa_input[i,"p_ru_lit_tubefeeding_per_cycle_DY2"]*df_psa_input[i,"uc_tubefeeding_pp"])+
+            (df_psa_input[i,"p_ru_lit_tubefeeding_per_cycle_DY2"]*df_psa_input[i,"uc_feedingtube_procdure"]))
+
+c_DY3<-
+      ((df_psa_input[i,"ru_nutrition_DY2"]*df_psa_input[i,"uc_nutrition"])+
+            (df_psa_input[i,"ru_lit_tubefeeding_per_cycle_DY2"]*df_psa_input[i,"uc_tubefeeding_pp"])+
+            (df_psa_input[i,"uc_feedingtube_procdure"]))
+
+c_DY_RT <-c_DY1*(1-df_psa_input[i,"ratio_DY3_RT"])*( df_psa_input[i,"p_DY1"])+
+          c_DY2*(1-df_psa_input[i,"ratio_DY3_RT"])*(1-df_psa_input[i,"p_DY1"])+
+          c_DY3*(df_psa_input[i,"ratio_DY3_RT"])
+
+c_DY_PT <-c_DY1*(1-df_psa_input[i,"ratio_DY3_PT"])*( df_psa_input[i,"p_DY1"])+
+          c_DY2*(1-df_psa_input[i,"ratio_DY3_PT"])*(1-df_psa_input[i,"p_DY1"])+
+          c_DY3*(df_psa_input[i,"ratio_DY3_PT"])
+
+c_MU1<-0
+
+c_MU2<-df_psa_input[i,"c_MU1_pp"]
+
+c_MU3<-df_psa_input[i,"c_MU2_pp"]
+
+c_MU_RT <-c_MU1*(1-df_psa_input[i,"ratio_MU3_RT"])*( df_psa_input[i,"p_MU1"])+
+          c_MU2*(1-df_psa_input[i,"ratio_MU3_RT"])*(1-df_psa_input[i,"p_MU1"])+
+          c_MU3*(df_psa_input[i,"ratio_MU3_RT"])
+
+c_MU_PT <-c_MU1*(1-df_psa_input[i,"ratio_MU3_PT"])*( df_psa_input[i,"p_MU1"])+
+          c_MU2*(1-df_psa_input[i,"ratio_MU3_PT"])*(1-df_psa_input[i,"p_MU1"])+
+          c_MU3*(df_psa_input[i,"ratio_MU3_PT"])
+
+c_DYXE_RT<-c_DY_RT+c_XE_RT
+c_DYXE_PT<-c_DY_PT+c_XE_PT
+
+
+#productivity loss
+
+productivity_loss_perpatient<-df_psa_input[i,"c_costperhr"]*df_psa_input[i,"p_paidjob"]*(df_psa_input[i,"p_frictionuse"]*(((1-df_psa_input[i,"p_less12"]-df_psa_input[i,"p_20to35"]-df_psa_input[i,"p_12to20"])*df_psa_input[i,"hr_fulltime_perweek"]*df_psa_input[i,"ru_friction_week"])+
+                                           (df_psa_input[i,"p_20to35"]*df_psa_input[i,"hr_20to35_perweek"]*df_psa_input[i,"ru_friction_week"])+
+                                           (df_psa_input[i,"p_12to20"]*df_psa_input[i,"hr_12to20_perweek"]*df_psa_input[i,"ru_friction_week"])+
+                                           (df_psa_input[i,"p_less12"]*df_psa_input[i,"hr_less12_perweek"]*df_psa_input[i,"ru_friction_week"]))+
+                             ((1-df_psa_input[i,"p_frictionuse"])*df_psa_input[i,"hr_avgsickleave_pertreatment_nofr"]))
+
+#calculate travel cost
+c_travel_PT<-((1-df_psa_input[i,"p_taxi"])*(df_psa_input[i,"c_parking"]+(df_psa_input[i,"ru_km_PT"]*df_psa_input[i,"uc_perkm_auto"]))+df_psa_input[i,"p_taxi"]*(df_psa_input[i,"uc_taxi_fixed"]+(df_psa_input[i,"ru_km_PT"]*df_psa_input[i,"uc_perkm_taxi"])))*df_psa_input[i,"ru_visit"]
+c_travel_RT<-((1-df_psa_input[i,"p_taxi"])*(df_psa_input[i,"c_parking"]+(df_psa_input[i,"ru_km_RT"]*df_psa_input[i,"uc_perkm_auto"]))+df_psa_input[i,"p_taxi"]*(df_psa_input[i,"uc_taxi_fixed"]+(df_psa_input[i,"ru_km_RT"]*df_psa_input[i,"uc_perkm_taxi"])))*df_psa_input[i,"ru_visit"]
+
+#the array 
+## fill the matrix with probs 
+## RT
+# for MU
+a_P_RT["MU", 1,] <- p_rt_MU_1
+a_P_RT["MU", 2,] <- p_rt_MU_2
+a_P_RT["MU", 3,] <- p_rt_MU_3
+
+#for DY
+
+a_P_RT["DY", 1,] <- p_rt_DY_1
+a_P_RT["DY", 2,] <- p_rt_DY_2
+a_P_RT["DY", 3,]  <-p_rt_DY_3
+
+#for XE
+a_P_RT["XE", 1,] <- p_rt_XE_1
+a_P_RT["XE", 2,] <- p_rt_XE_2
+a_P_RT["XE", 3,] <- p_rt_XE_3
+
+
+## PT
+# for MU2
+a_P_PT["MU", 1,] <- p_pt_MU_1
+a_P_PT["MU", 2,] <- p_pt_MU_2
+a_P_PT["MU", 3,] <- p_pt_MU_3
+
+
+# for DY2
+a_P_PT["DY", 1,] <- p_pt_DY_1
+a_P_PT["DY", 2,] <- p_pt_DY_2
+a_P_PT["DY", 3,]  <-p_pt_DY_3
+
+# for XE2
+a_P_PT["XE", 1,] <- p_pt_XE_1
+a_P_PT["XE", 2,] <- p_pt_XE_2
+a_P_PT["XE", 3,] <- p_pt_XE_3
+
+
+a_P_RT_1<-a_P_RT[,1,]
+a_P_RT_2<-a_P_RT[,2,]
+a_P_RT_3<-a_P_RT[,3,]
+
+a_P_PT_1<-a_P_PT[,1,]
+a_P_PT_2<-a_P_PT[,2,]
+a_P_PT_3<-a_P_PT[,3,]
+
+#create array for survival
+a_p_survival_RT <- array(0, 
+                  dim = c(n_Toxicity, n_cohort, n_cycles+1),
+                dimnames = list(v_names_toxicity, v_names_cohort, 
+                                v_names_cycles))
+
+a_p_survival_PT <- array(0, 
+                  dim = c(n_Toxicity, n_cohort, n_cycles+1),
+                dimnames = list(v_names_toxicity, v_names_cohort, 
+                                v_names_cycles))
+
+
+
+#p_survival <- p_survival[-c(301),]
+
+a_p_survival_RT["MU",1:3 ,]<-p_survival
+
+a_p_survival_RT["DY",1:3 ,]<-p_survival
+a_p_survival_RT["XE",1:3 ,]<-p_survival
+
+a_p_survival_PT<-a_p_survival_RT
+
+
+
+#number of new toxicity in each cycle
+
+a_p_RT_SurvTx <- a_inc_tx_RT * a_p_survival_RT
+a_p_PT_SurvTx <- a_inc_tx_PT * a_p_survival_PT
+
+#separated by cohort
+m_M_Tx_RT_1<- a_p_RT_SurvTx[,1,]
+m_M_Tx_RT_2<- a_p_RT_SurvTx[,2,]
+m_M_Tx_RT_3<- a_p_RT_SurvTx[,3,]
+
+#separated by cohort
+m_M_Tx_PT_1<- a_p_PT_SurvTx[,1,]
+m_M_Tx_PT_2<- a_p_PT_SurvTx[,2,]
+m_M_Tx_PT_3<- a_p_PT_SurvTx[,3,]
+
+
+for (t in 1:300){  # loop through the number of cycles
+  # estimate the cohort trace for cycle t + 1 using the t-th matrix from the probability array 
+  
+  m_M_Tx_RT_1[ ,t+1] <- m_M_Tx_RT_1[ ,t] * a_P_RT_1[ ,t] 
+  m_M_Tx_PT_1[ ,t+1] <- m_M_Tx_PT_1[ ,t] * a_P_PT_1[ ,t]
+}
+
+for (t in 1:300){  # loop through the number of cycles
+  # estimate the cohort trace for cycle t + 1 using the t-th matrix from the probability array 
+  
+  m_M_Tx_RT_2[ ,t+1] <- m_M_Tx_RT_2[ ,t] * a_P_RT_2[ ,t] 
+  m_M_Tx_PT_2[ ,t+1] <- m_M_Tx_PT_2[ ,t] * a_P_PT_2[ ,t] 
+}
+
+for (t in 1:300){  # loop through the number of cycles
+  # estimate the cohort trace for cycle t + 1 using the t-th matrix from the probability array 
+  
+  m_M_Tx_RT_3[ ,t+1] <- m_M_Tx_RT_3[ ,t] * a_P_RT_3[ ,t] 
+  m_M_Tx_PT_3[ ,t+1] <- m_M_Tx_PT_3[ ,t] * a_P_PT_3[ ,t]  
+}
+
+m_M_Tx_RT_all <-m_M_Tx_RT_1+m_M_Tx_RT_2+m_M_Tx_RT_3
+m_M_Tx_RT_all<- as.matrix(m_M_Tx_RT_all)
+m_M_Tx_RT_all<- t(m_M_Tx_RT_all)
+m_M_Tx_RT_all<-as.data.frame(m_M_Tx_RT_all)
+m_M_Tx_RT_all[,"DY_XE"]<-m_M_Tx_RT_all[,"DY"]*df_psa_input[i,"p_dyxe"]
+m_M_Tx_RT_all[,"DY"]<-m_M_Tx_RT_all[,"DY"]*(1-df_psa_input[i,"p_dyxe"])
+m_M_Tx_RT_all[,"XE"]<-m_M_Tx_RT_all[,"XE"]-m_M_Tx_RT_all[,"DY_XE"]
+m_M_Tx_RT_all<- as.matrix(m_M_Tx_RT_all)
+
+m_M_Tx_PT_all <-m_M_Tx_PT_1+m_M_Tx_PT_2+m_M_Tx_PT_3
+m_M_Tx_PT_all <-t(m_M_Tx_PT_all)
+m_M_Tx_PT_all<- as.matrix(m_M_Tx_PT_all)
+m_M_Tx_PT_all<-as.data.frame(m_M_Tx_PT_all)
+m_M_Tx_PT_all[,"DY_XE"]<-m_M_Tx_PT_all[,"DY"]*df_psa_input[i,"p_dyxe"]
+m_M_Tx_PT_all[,"DY"]<-m_M_Tx_PT_all[,"DY"]*(1-df_psa_input[i,"p_dyxe"])
+m_M_Tx_PT_all[,"XE"]<-m_M_Tx_PT_all[,"XE"]-m_M_Tx_PT_all[,"DY_XE"]
+m_M_Tx_PT_all<- as.matrix(m_M_Tx_PT_all)
+
+
+
+#calculate the total LY
+
+
+v_LY_RT <- sum((m_M_RT[,"PF"]))/6+sum((m_M_RT[,"PD"]))/6
+v_LY_PT <- sum((m_M_PT[,"PF"]))/6+sum((m_M_PT[,"PD"]))/6
+
+#calculate disutility with the weighting of each grade
+
+#u_XE
+u_XE_RT <-df_psa_input[i,"u_XE1"]*(1-df_psa_input[i,"ratio_XE3_RT"])*( df_psa_input[i,"p_XE1"])+
+          df_psa_input[i,"u_XE2"]*(1-df_psa_input[i,"ratio_XE3_RT"])*(1-df_psa_input[i,"p_XE1"])+
+          df_psa_input[i,"u_XE3"]*(df_psa_input[i,"ratio_XE3_RT"])
+
+
+
+
+u_XE_PT <-df_psa_input[i,"u_XE1"]*(1-df_psa_input[i,"ratio_XE3_PT"])*( df_psa_input[i,"p_XE1"])+
+          df_psa_input[i,"u_XE2"]*(1-df_psa_input[i,"ratio_XE3_PT"])*(1-df_psa_input[i,"p_XE1"])+
+          df_psa_input[i,"u_XE3"]*(df_psa_input[i,"ratio_XE3_PT"])
+
+
+
+
+#u_DY
+u_DY_RT <-df_psa_input[i,"u_DY1"]*(1-df_psa_input[i,"ratio_DY3_RT"])*( df_psa_input[i,"p_DY1"])+
+          df_psa_input[i,"u_DY2"]*(1-df_psa_input[i,"ratio_DY3_RT"])*(1-df_psa_input[i,"p_DY1"])+
+          df_psa_input[i,"u_DY3"]*(df_psa_input[i,"ratio_DY3_RT"])
+
+
+
+u_DY_PT <-df_psa_input[i,"u_DY1"]*(1-df_psa_input[i,"ratio_DY3_PT"])*( df_psa_input[i,"p_DY1"])+
+          df_psa_input[i,"u_DY2"]*(1-df_psa_input[i,"ratio_DY3_PT"])*(1-df_psa_input[i,"p_DY1"])+
+          df_psa_input[i,"u_DY3"]*(df_psa_input[i,"ratio_DY3_PT"])
+
+
+
+#u_MU
+u_MU_RT <-df_psa_input[i,"u_MU1"]*(1-df_psa_input[i,"ratio_MU3_RT"])*( df_psa_input[i,"p_MU1"])+
+          df_psa_input[i,"u_MU2"]*(1-df_psa_input[i,"ratio_MU3_RT"])*(1-df_psa_input[i,"p_MU1"])+
+          df_psa_input[i,"u_MU3"]*(df_psa_input[i,"ratio_MU3_RT"])
+
+
+u_MU_PT <-df_psa_input[i,"u_MU1"]*(1-df_psa_input[i,"ratio_MU3_PT"])*( df_psa_input[i,"p_MU1"])+
+          df_psa_input[i,"u_MU2"]*(1-df_psa_input[i,"ratio_MU3_PT"])*(1-df_psa_input[i,"p_MU1"])+
+          df_psa_input[i,"u_MU3"]*(df_psa_input[i,"ratio_MU3_PT"])
+
+u_DYXE_RT<-0.93*(u_DY_RT+u_XE_RT)
+u_DYXE_PT<-0.93*(u_DY_PT+u_XE_PT)
+
+#adding age effect to the utility
+u_PF_older<-(df_psa_input[i,"u_PF_75"]*df_psa_input[i,"u_PF"])
+u_PD_older<-(df_psa_input[i,"u_PD_75"]*df_psa_input[i,"u_PD"])
+
+u_PF<-c(rep(df_psa_input[i,"u_PF"],60), rep(u_PF_older,241))
+u_PD<-c(rep(df_psa_input[i,"u_PD"],60), rep(u_PD_older,241))
+u_D <-c(rep( df_psa_input[i,"u_D"],301))
+
+utility <-array(0,  # Create 3-D array
+                dim = c(n_cycles+1,n_states),
+                dimnames = list( 
+                                v_names_cycles,v_names_states))
+utility[,"PF"]<- u_PF
+utility[,"PD"]<- u_PD
+utility[,"D"]<- u_D
+
+#calculate the total QALY and discounted QALY
+v_u_RT <- m_M_RT * utility
+v_u_PT <- m_M_PT * utility
+v_du_RT <-m_M_Tx_RT_all %*% c(u_MU_RT, u_XE_RT, u_DY_RT,u_DYXE_RT )
+v_du_PT <-m_M_Tx_PT_all %*% c(u_MU_PT, u_XE_PT, u_DY_PT,u_DYXE_PT )
+
+v_dwe<-as.matrix(v_dwe)
+v_dwc<-as.matrix(v_dwc)
+
+v_disu_RT <- t(v_u_RT) %*%  v_dwe
+v_disu_PT <- t(v_u_PT ) %*%  v_dwe
+v_disdu_tx_RT <- t(v_du_RT) %*%  v_dwe
+v_disdu_tx_PT <- t(v_du_PT ) %*%  v_dwe
+
+v_tu_RT <- sum(v_u_RT)/6
+v_tu_PT <- sum(v_u_PT)/6
+v_tdu_RT <- sum(v_du_RT)/6
+v_tdu_PT <- sum(v_du_PT)/6
+
+v_dis_tu_RT <- sum(v_disu_RT)/6
+v_dis_tu_PT <- sum(v_disu_PT)/6
+v_dis_tdu_RT <- sum(v_disdu_tx_RT)/6
+v_dis_tdu_PT <- sum(v_disdu_tx_PT)/6
+
+
+v_totalu_RT <-v_tu_RT-v_tdu_RT
+v_totalu_PT <-v_tu_PT-v_tdu_PT
+
+v_dis_totalu_RT <-v_dis_tu_RT-v_dis_tdu_RT
+v_dis_totalu_PT <-v_dis_tu_PT-v_dis_tdu_PT
+
+
+#calculate costs
+n_MU_RT<- a_p_RT_SurvTx["MU",1,]+ a_p_RT_SurvTx["MU",2,]+ a_p_RT_SurvTx["MU",3,]
+n_MU_RT_all <-sum(n_MU_RT)
+n_MU_PT<- a_p_PT_SurvTx["MU",1,]+ a_p_PT_SurvTx["MU",2,]+ a_p_PT_SurvTx["MU",3,]
+n_MU_PT_all <-sum(n_MU_PT)
+
+
+v_c_MU_RT<-n_MU_RT_all*c_MU_RT
+v_c_MU_PT<-n_MU_PT_all*c_MU_PT
+v_c_tx_RT <-m_M_Tx_RT_all %*% c(0, c_XE_RT,  c_DY_RT, c_DYXE_RT)
+v_c_tx_PT <-m_M_Tx_PT_all %*% c(0, c_XE_PT,  c_DY_PT, c_DYXE_PT )
+v_disc_tx_RT <- t(v_c_tx_RT) %*%  v_dwc
+v_disc_tx_PT <- t(v_c_tx_PT) %*%  v_dwc
+
+
+
+v_totalc_tx_RT<- sum(v_c_tx_RT)+v_c_MU_RT
+v_totalc_tx_PT<- sum(v_c_tx_PT)+v_c_MU_PT
+
+v_totaldisc_tx_RT<- sum(v_disc_tx_RT)+v_c_MU_RT
+v_totaldisc_tx_PT<- sum(v_disc_tx_PT)+v_c_MU_PT
+
+#calculate the endlife cost
+
+m_M_PT_calculate <- as.data.frame(m_M_PT)
+m_M_PT_calculate<- m_M_PT_calculate %>%
+  mutate(
+  new_dead_n = D- lag(D),
+  new_dead_n = abs(new_dead_n)
+  
+ )
+
+m_M_RT_calculate <- as.data.frame(m_M_RT)
+m_M_RT_calculate<- m_M_RT_calculate %>%
+  mutate(
+  new_dead_n = D-lag(D),
+  new_dead_n = abs(new_dead_n)
+  
+ )
+
+m_M_RT_calculate[is.na(m_M_RT_calculate)]<-0
+
+v_names_states_nd<-c("PF","PD", "D", "new_dead_n")
+n_states_nd  <- length(v_names_states_nd)  
+a_c_endlife <- array(0, 
+                  dim = c(n_cycles+1,n_states_nd),
+                dimnames = list(
+                                v_names_cycles,v_names_states_nd))
+
+a_c_endlife[, "PD"] <- 0
+a_c_endlife[, "PF"] <- 0
+a_c_endlife[, "D"] <- 0
+
+for(j in 1:35){
+  
+    a_c_endlife[((6*j)-5):(j*6), "new_dead_n"] <- df_psa_input[i,paste0("c_endlife_", j)]
+  }
+a_c_endlife[211:301, "new_dead_n"] <- df_psa_input[i,"c_endlife_35"]
+
+
+v_c_endcost_RT<- m_M_RT_calculate *a_c_endlife
+v_c_endcost_PT<- m_M_PT_calculate *a_c_endlife
+
+v_c_endcost_RT[is.na(v_c_endcost_RT)]<-0
+v_c_endcost_PT[is.na(v_c_endcost_PT)]<-0
+
+
+v_dc_endcost_RT <- t(v_c_endcost_RT) %*%v_dwc
+v_dc_endcost_PT <- t(v_c_endcost_PT) %*%v_dwc
+
+#calculating future cost
+
+
+a_c_futurecost <-  array(0, 
+                  dim = c(n_cycles+1,n_states),
+                dimnames = list(
+                                v_names_cycles,v_names_states))
+
+
+
+for(j in 1:35){
+  
+    a_c_futurecost[((6*j)-5):(j*6), "PF"] <- df_psa_input[i,paste0("c_futurecost_", j)]
+    a_c_futurecost[((6*j)-5):(j*6), "PD"] <- df_psa_input[i,paste0("c_futurecost_", j)]
+  }
+a_c_futurecost[211:301,"PF" ] <- df_psa_input[i,"c_futurecost_35"]
+a_c_futurecost[211:301,"PD" ] <- df_psa_input[i,"c_futurecost_35"]
+
+a_c_futurecost[,"D"] <- 0
+
+v_c_fc_RT <- m_M_RT * a_c_futurecost
+v_c_fc_PT <- m_M_PT * a_c_futurecost
+
+v_dc_fc_RT  <- t(v_c_fc_RT) %*%v_dwc
+v_dc_fc_PT  <- t(v_c_fc_PT) %*%v_dwc
+
+v_tfc_RT<-sum(v_c_fc_RT)
+v_tfc_PT<-sum(v_c_fc_PT)
+
+v_tdisfc_RT<-sum(v_dc_fc_RT)
+v_tdisfc_PT<-sum(v_dc_fc_PT)
+
+v_tendc_RT<-sum(v_c_endcost_RT)
+v_tendc_PT<-sum(v_c_endcost_PT)
+
+v_tdisendc_RT<-sum(v_dc_endcost_RT)
+v_tdisendc_PT<-sum(v_dc_endcost_PT)
+
+
+
+
+# Define and initialize the variables before the calculations
+    v_tc_PT <- 0
+    v_tc_RT <- 0
+   
+    v_totalu_PT <- 0
+    v_totalu_RT <- 0
+    ICER <- 0
+
+v_tc_RT <- df_psa_input[i,"c_RT"]+v_totalc_tx_RT+ productivity_loss_perpatient+c_travel_RT+v_tfc_RT
+v_tc_PT <- df_psa_input[i,"c_PT"]+v_totalc_tx_PT+ productivity_loss_perpatient+c_travel_PT+v_tfc_PT
+
+v_dis_tc_RT <- df_psa_input[i,"c_RT"]+ v_totaldisc_tx_RT+ productivity_loss_perpatient+c_travel_RT+v_tdisfc_RT
+v_dis_tc_PT <- df_psa_input[i,"c_PT"]+ v_totaldisc_tx_PT+ productivity_loss_perpatient+c_travel_PT+v_tdisfc_PT
+    
+v_totalu_RT <-v_tu_RT-v_tdu_RT
+v_totalu_PT <-v_tu_PT-v_tdu_PT
+
+v_dis_totalu_RT <-v_dis_tu_RT-v_dis_tdu_RT
+v_dis_totalu_PT <-v_dis_tu_PT-v_dis_tdu_PT   
+   
+   
+ICER_dis<- (v_dis_tc_PT-v_dis_tc_RT)/(v_dis_totalu_PT-v_dis_totalu_RT )
+ICER<- (v_tc_PT-v_tc_RT)/(v_totalu_PT-v_totalu_RT )
+i_dis_QALY<- v_dis_totalu_PT - v_dis_totalu_RT 
+
+
+  results_df <- rbind(results_df, data.frame(
+      v_totalc_tx_RT=v_totalc_tx_RT,
+      v_totalc_tx_PT=v_totalc_tx_PT,
+      v_totaldisc_tx_RT=v_totaldisc_tx_RT,
+      v_totaldisc_tx_PT=v_totaldisc_tx_PT,
+      v_tc_PT = v_tc_PT,
+      v_tc_RT = v_tc_RT,
+      v_dis_tc_PT=v_dis_tc_PT,
+      v_dis_tc_RT=v_dis_tc_RT,
+      v_LY_RT = v_LY_RT,
+      v_LY_PT = v_LY_PT,
+      v_totalu_PT = v_totalu_PT,
+      v_totalu_RT = v_totalu_RT,
+      v_dis_totalu_RT=v_dis_totalu_RT,
+      v_dis_totalu_PT=v_dis_totalu_PT,
+      ICER_dis= ICER_dis,
+      ICER = ICER   # Make a dataframe from the matrix 
+     ))
+ 
+  result_list[[length(result_list) + 1]] <- results_df
+}
+
+  combined_results_df <- result_list
+
+}
+```
+
+
+```{r}
+## convert Prob of tx to each cycle
+equation <- function(A) {
+  return(3 * A - 3 * A^2 + A^3 - 0.0744)
+}
+result <- uniroot(equation, interval = c(0, 1))
+A_value <- result$root
+beta_params(A_value, 0.1*A_value)
+```
+
+
+```{r}
+# beta param
+A <-0.0000001
+beta_params(A, 0.1*A)
+```
+
+
+
+```{r}
+
+
+ param_psa <- make_psa_df(param = param, n_iter = 5000, seed = 123)
+
+ df_psa_input <- gen_psa(param_psa)
+ 
+ psa_result<-df_psa(df_psa_input)
+ 
+ result_table <-psa_result[[5000]]
+
+```
+
+```{r}
+new_column_names <- c("Cost_tx_RT","Cost_tx_PT","dis_Cost_tx_RT","dis_Cost_tx_PT", "Costs_PT", "Costs_RT","dis_Costs_PT", "dis_Costs_RT", "LY_RT","LY_PT", "QALY_PT", "QALY_RT","dis_QALY_RT", "dis_QALY_PT","ICER_dis","ICER")
+
+colnames(result_table) <- new_column_names
+
+new_row_names <- paste("Iteration", 1:5000, sep = " ")
+rownames(result_table) <- new_row_names
+
+result_table<- result_table %>% mutate(
+  inc_QALY= dis_QALY_PT-dis_QALY_RT,
+  inc_LY = LY_PT-LY_RT,
+  inc_Cost = dis_Costs_PT- dis_Costs_RT
+)
+
+RT<-list( result_table[, "LY_RT"],result_table[, "dis_QALY_RT"],result_table[, "dis_Costs_RT"]
+  
+)
+PT<-list( result_table[, "LY_PT"],result_table[, "dis_QALY_PT"],result_table[, "dis_Costs_PT"]
+  
+)
+m_output<-result_table
+
+```
+
+```{r}
+
+l_df_output_incr <- list()
+df_output <- as.data.frame(m_output)
+
+
+  # Incremental effects between intervention and control in lifeyears 
+  # 1 = no Treatment 
+  # 2 = Treatment
+ l_v_IncrLY_PSA    <- result_table[, "LY_PT"]    - result_table[, "LY_RT"] 
+ l_v_IncrQALY_PSA  <- result_table[, "dis_QALY_PT"]  - result_table[, "dis_QALY_RT"] 
+ l_v_IncrCosts_PSA <- result_table[, "dis_Costs_PT"] - result_table[, "dis_Costs_RT"]
+
+ 
+ df_output$iLY    <- result_table[, "LY_PT"]    - result_table[, "LY_RT"] 
+ df_output$iQALY  <- result_table[, "dis_QALY_PT"]  - result_table[, "dis_QALY_RT"] 
+ df_output$iCosts <- result_table[, "dis_Costs_PT"] - result_table[, "dis_Costs_RT"]
+ 
+ 
+l_df_PSA_LY <- df_PSA_LY<- data.frame(Strategy = v_names_trt,
+                     Cost = c(mean(m_output[, "dis_Costs_RT"]), mean(m_output[, "dis_Costs_PT"])),
+                     LY = c(mean(m_output[, "LY_RT"]), mean(m_output[, "LY_PT"])),
+                     Inc_Cost =   c(NA, mean(l_v_IncrCosts_PSA)),
+                     Inc_Effect = c(NA, mean(l_v_IncrLY_PSA)))
+
+
+#l_df_costs <-df_PSA_LY<-data.frame(Strategy = v_names_trt,
+#                     c_DY=c(mean(m_output[, "cost_DY_RT"]),mean(m_output[,"cost_DY_PT"])),             
+#                     Tx_Cost = c(mean(m_output[, "Cost_tx_RT"]), mean(m_output[, "Cost_tx_PT"])),
+#                     Productivity_loss=c(mean(m_output[,"productivity_loss"]),mean(m_output[,"productivity_loss"])),
+#                     Trvel_Cost=c(mean(m_output[, "Cost_travel_RT"]), mean(m_output[, "Cost_travel_PT"])),
+#                     Endlife_Cost= c(mean(m_output[, "Cost_end_RT"]), mean(m_output[, "Cost_end_PT"])),
+#                     Future_Cost= c(mean(m_output[, "Cost_future_RT"]), mean(m_output[, "Cost_future_RT"])),
+#                     Cost = c(mean(m_output[, "Costs_RT"]), mean(m_output[, "Costs_PT"])),
+#                     LY = c(mean(m_output[, "LY_RT"]), mean(m_output[, "LY_PT"])),
+#                    Inc_Cost =   c(NA, mean(l_v_IncrCosts_PSA)),
+#                    Inc_Effect = c(NA, mean(l_v_IncrLY_PSA)))
+
+#openxlsx::write.xlsx(l_df_costs, "C:/Users/68146ych/OneDrive - Erasmus University Rotterdam/Desktop/HNC model/cost_breakdown_RCT.xlsx")                       
+
+l_df_cea_PSA_LY <- calculate_icers(cost= df_PSA_LY$Cost,
+                                   effect= df_PSA_LY$LY,
+                                  strategies= df_PSA_LY$Strategy)
+
+
+
+l_df_PSA_QALY <- df_PSA_QALY <- data.frame(Strategy = v_names_trt,
+                     Cost = c(mean(m_output[, "dis_Costs_RT"]), mean(m_output[, "dis_Costs_PT"])),
+                     QALY = c(mean(m_output[, "dis_QALY_RT"]),  mean(m_output[, "dis_QALY_PT"])),
+                     Inc_Cost = c(NA, mean(l_v_IncrCosts_PSA)),
+                     Inc_Effect = c(NA, mean(l_v_IncrQALY_PSA)))
+                     
+l_df_cea_PSA_QALY <- calculate_icers(cost = df_PSA_QALY$Cost,
+                                        effect   = df_PSA_QALY$QALY,
+                                      strategies = df_PSA_LY$Strategy)
+
+
+l_df_output_incr <- df_output
+
+
+```
+
+```{r}
+ plot_inc_CE_plane_LY <- make_psa_obj(cost  = as.data.frame(l_df_output_incr$inc_Cost), 
+                               effectiveness = as.data.frame(l_df_output_incr$inc_LY), 
+                               strategies    = "Incremental")
+
+plot(plot_inc_CE_plane_LY)
+
+plot(plot_inc_CE_plane_LY)+
+  labs(title     = paste("Incremental Cost-effectiveness plane")
+         ) +
+      xlab("Incremental Effectiveness (LY)") +
+      ylab("Incremental Costs") +  
+    geom_vline(xintercept = 0, color = "gray", size = 0.6) +
+  geom_hline(yintercept = 0, color ="gray", size = 0.6) +
+        scale_color_manual(values = c("blue", "black")) + 
+    scale_fill_manual(values = c("blue", "black"))
+
+
+
+ plot_inc_CE_plane_QALY <- make_psa_obj(cost  = as.data.frame(l_df_output_incr$inc_Cost), 
+                               effectiveness = as.data.frame(l_df_output_incr$inc_QALY), 
+                               strategies    = "Incremental")
+
+plot_inc_CE_plane_QALY_RCT<-plot(plot_inc_CE_plane_QALY)+
+  labs(title     = paste("Incremental Cost-effectiveness plane")
+         ) +
+      xlab("Incremental Effectiveness (QALY)") +
+      ylab("Incremental Costs") +  
+    geom_vline(xintercept = 0, color = "gray", size = 0.6) +
+  geom_hline(yintercept = 0, color ="gray", size = 0.6) +
+  geom_abline(intercept = 0, slope = 20000, color = "red", linetype = "solid")+
+  geom_abline(intercept = 0, slope = 50000, color = "red", linetype = "longdash")+
+        scale_color_manual(values = c("blue", "black")) + 
+    scale_fill_manual(values = c("blue", "black"))
+
+
+ggsave("plot_inc_CE_plane_QALY_RCT.png", plot = plot_inc_CE_plane_QALY_RCT, width = 8, height = 6, units = "in", device = "png")
+
+```
+
+```{r}
+
+wtp <- seq(0, 150000, by = 1000)
+nmb = sapply(wtp, function(lambda) df_output$iQALY * lambda - df_output$iCosts)
+prob_ce = apply(nmb, 2, function(x) mean(x > 0))
+prob_not_ce = 1 - prob_ce
+
+ceac_data = data.frame(WTP = wtp, Probability_CE = prob_ce, Probability_Not_CE = prob_not_ce)
+
+library(tidyr)
+ceac_data_long = pivot_longer(ceac_data, 
+                              cols = c("Probability_CE", "Probability_Not_CE"), 
+                              names_to = "Outcome", 
+                              values_to = "Probability")
+
+
+CEAC_cohort<- ggplot(ceac_data_long, aes(x = WTP/1000, y = Probability, color = Outcome)) +
+  geom_line() +
+  scale_color_manual(values = c("Probability_CE" = "blue", "Probability_Not_CE" = "red")) +
+  labs(title = "Cost-Effectiveness Acceptability Curves",
+       x = "Willingness to Pay Threshold(1000 euro)",
+       y = "Probability") +
+  theme_minimal() +
+  guides(color = guide_legend(title = "Outcome"))
+
+ggsave("CEAC_cohort.png",CEAC_cohort, width = 10, height = 8, dpi = 300)
+
+
+
+```
+
+```{r}
+
+# Given WTP threshold
+specific_wtp = 20000
+
+# Find the index of the specific WTP threshold
+wtp_index = which(wtp == specific_wtp)
+
+# Retrieve the probability of being cost-effective at the specific WTP threshold
+specific_prob_ce = prob_ce[wtp_index]
+
+# Print the probability
+specific_prob_ce
+
+
+```
+
